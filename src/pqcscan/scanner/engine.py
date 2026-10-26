@@ -2,6 +2,9 @@
 
 Routing priority per file is dependency-manifest -> AST source -> config file, so
 ``package.json`` is read as a manifest rather than scanned for cipher strings.
+The certificate scanner is additive rather than exclusive: a config file can both
+enable a weak cipher suite *and* inline a PEM private key, and a ``.pem`` file has
+no other owner. Every other file still gets exactly one scanner.
 
 Scanning is deliberately single-threaded. Measured on a 1,800-file tree the
 serial pipeline does ~1,700 files/s end-to-end, and ~75% of per-file cost is the
@@ -19,7 +22,13 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from pqcscan.config import ALL_LANGUAGES, PqcConfig
-from pqcscan.languages import go_rules, java_rules, javascript_rules, python_rules
+from pqcscan.languages import (
+    go_rules,
+    java_rules,
+    javascript_rules,
+    python_rules,
+    rust_rules,
+)
 from pqcscan.utils.file_walker import discover_files
 
 from .ast_scanner import AstScanner
@@ -30,12 +39,15 @@ from .base import (
     meets_threshold,
     severity_rank,
 )
+from .certificate_scanner import CertificateScanner
 from .config_scanner import ConfigScanner
 from .context import apply_context_hints
 from .dependency_scanner import DependencyScanner
+from .suppressions import parse_suppressions
 
 _LANG_MODULES = {
-    m.LANGUAGE: m for m in (python_rules, javascript_rules, java_rules, go_rules)
+    m.LANGUAGE: m
+    for m in (python_rules, javascript_rules, java_rules, go_rules, rust_rules)
 }
 
 
@@ -51,6 +63,13 @@ class ScanResult:
     root_path: str = "."
     #: The paths that were requested, as given by the caller.
     scanned_paths: list[str] = field(default_factory=list)
+    #: Findings waived by an inline ``pqc-scan: ignore`` directive. Kept out of
+    #: ``findings`` (so they do not gate CI) but still reported, so a waiver is
+    #: visible in the console summary, in JSON, and as a SARIF suppression.
+    suppressed: list[Finding] = field(default_factory=list)
+    #: Pre-existing findings matched by a baseline file. Also kept out of
+    #: ``findings`` so only *new* crypto gates the build.
+    baselined: list[Finding] = field(default_factory=list)
 
     def counts_by_severity(self) -> dict[str, int]:
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
@@ -62,6 +81,24 @@ class ScanResult:
     @property
     def total(self) -> int:
         return len(self.findings)
+
+    @property
+    def suppressed_count(self) -> int:
+        return len(self.suppressed)
+
+    @property
+    def baselined_count(self) -> int:
+        return len(self.baselined)
+
+    def all_findings(self) -> list[Finding]:
+        """Every finding the scan produced, reported or not, in sort order.
+
+        Inventory outputs (CBOM) use this: a waived or pre-existing algorithm is
+        still part of the migration surface.
+        """
+        return sorted(
+            [*self.findings, *self.suppressed, *self.baselined], key=finding_sort_key
+        )
 
 
 def extensions_for_languages(languages: Iterable[str]) -> set[str]:
@@ -99,15 +136,22 @@ def run_scan(
     ast_scanner = AstScanner(context)
     config_scanner = ConfigScanner(context) if config.scan_configs else None
     dependency_scanner = DependencyScanner(context) if config.scan_dependencies else None
+    certificate_scanner = (
+        CertificateScanner(context) if config.scan_certificates else None
+    )
 
-    def route(path: Path):
+    def route(path: Path) -> list:
+        """Every scanner that should read *path* (primary first)."""
+        scanners = []
         if dependency_scanner is not None and dependency_scanner.supports(path):
-            return dependency_scanner
-        if path.suffix in allowed_exts and ast_scanner.supports(path):
-            return ast_scanner
-        if config_scanner is not None and config_scanner.supports(path):
-            return config_scanner
-        return None
+            scanners.append(dependency_scanner)
+        elif path.suffix in allowed_exts and ast_scanner.supports(path):
+            scanners.append(ast_scanner)
+        elif config_scanner is not None and config_scanner.supports(path):
+            scanners.append(config_scanner)
+        if certificate_scanner is not None and certificate_scanner.supports(path):
+            scanners.append(certificate_scanner)
+        return scanners
 
     excludes = list(config.exclude)
     if extra_excludes:
@@ -133,17 +177,18 @@ def run_scan(
     errors: list[str] = []
     files_scanned = 0
 
-    for path in discover_files(path_list, exclude=excludes, accept=lambda p: route(p) is not None):
+    for path in discover_files(path_list, exclude=excludes, accept=lambda p: bool(route(p))):
         if changed_set is not None and path.resolve() not in changed_set:
             continue
-        scanner = route(path)
-        if scanner is None:
+        scanners = route(path)
+        if not scanners:
             continue
         files_scanned += 1
-        try:
-            findings.extend(scanner.scan_file(path))
-        except Exception as exc:  # never let one bad file abort the run
-            errors.append(f"{path}: {exc}")
+        for scanner in scanners:
+            try:
+                findings.extend(scanner.scan_file(path))
+            except Exception as exc:  # never let one bad file abort the run
+                errors.append(f"{path}: {exc}")
 
     # A grammar that failed to import means a whole language was skipped —
     # surface that instead of silently reporting zero findings for it.
@@ -154,9 +199,28 @@ def run_scan(
     filtered = [f for f in findings if meets_threshold(f.severity, threshold)]
     filtered.sort(key=finding_sort_key)
 
+    # Partition out inline-suppressed findings. This runs *after* the threshold
+    # filter so the "suppressed" count only reflects findings that would
+    # otherwise have been reported.
+    suppressed: list[Finding] = []
+    if config.honor_suppressions:
+        filtered, suppressed = partition_suppressed(filtered)
+
+    # Split off findings a baseline already accepted, so only new crypto gates
+    # the build. A baseline that cannot be read is a hard error at the CLI
+    # boundary, never a silent "everything is new".
+    baselined: list[Finding] = []
+    if config.baseline_path:
+        from pqcscan.baseline import Baseline
+
+        loaded = Baseline.load(config.baseline_path)
+        filtered, baselined = loaded.partition(filtered)
+
     # Attach library-implementation context hints (path heuristic) to findings
     # the language analyzers did not already annotate.
     apply_context_hints(filtered)
+    apply_context_hints(suppressed)
+    apply_context_hints(baselined)
 
     return ScanResult(
         findings=filtered,
@@ -166,7 +230,41 @@ def run_scan(
         errors=errors,
         root_path=root_path,
         scanned_paths=[str(p) for p in path_list],
+        suppressed=suppressed,
+        baselined=baselined,
     )
+
+
+def partition_suppressed(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
+    """Split *findings* into (reported, suppressed) by inline ignore directives.
+
+    Only files that actually produced a finding are re-read, so the common
+    clean-file path costs nothing.
+    """
+    by_file: dict[str, list[Finding]] = {}
+    for finding in findings:
+        by_file.setdefault(finding.file_path, []).append(finding)
+
+    waived: set[int] = set()
+    for file_path, group in by_file.items():
+        try:
+            text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        directives = parse_suppressions(text)
+        if not directives:
+            continue
+        for finding in group:
+            start, end = finding.line_span
+            directive = directives.match(finding.rule_id, start, end)
+            if directive is not None:
+                finding.suppressed = True
+                finding.suppression_reason = directive.describe()
+                waived.add(id(finding))
+
+    reported = [f for f in findings if id(f) not in waived]
+    suppressed = [f for f in findings if id(f) in waived]
+    return reported, suppressed
 
 
 def timed_scan(*args, **kwargs) -> ScanResult:

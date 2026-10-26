@@ -11,7 +11,7 @@ import yaml
 from pqcscan.scanner.base import SEVERITY_LOW
 
 DEFAULT_CONFIG_NAMES = (".pqcscan.yml", ".pqcscan.yaml", "pqcscan.yml")
-ALL_LANGUAGES = ["python", "javascript", "java", "go"]
+ALL_LANGUAGES = ["python", "javascript", "java", "go", "rust"]
 
 _VALID_SEVERITIES = ("critical", "high", "medium", "low")
 
@@ -39,7 +39,16 @@ class PqcConfig:
     languages: list[str] = field(default_factory=lambda: list(ALL_LANGUAGES))
     scan_configs: bool = True
     scan_dependencies: bool = True
+    #: Scan PEM/OpenSSH key material and X.509 certificates (PQC015 / PQC016).
+    scan_certificates: bool = True
+    #: Honor inline ``pqc-scan: ignore`` directives. Set false (config
+    #: ``suppressions: false`` / CLI ``--no-suppress``) for an audit run that
+    #: must see waived findings too.
+    honor_suppressions: bool = True
     disabled_rules: set[str] = field(default_factory=set)
+    #: Path to a baseline file whose findings are treated as accepted debt.
+    #: ``None`` disables baselining entirely (no auto-discovery).
+    baseline_path: Optional[str] = None
     default_format: str = "console"
     cbom_path: str = "cbom.json"
     #: Path the config was loaded from (None when using built-in defaults).
@@ -76,6 +85,16 @@ class PqcConfig:
             cfg.scan_configs = bool(data["scan_configs"])
         if "scan_dependencies" in data:
             cfg.scan_dependencies = bool(data["scan_dependencies"])
+        if "scan_certificates" in data:
+            cfg.scan_certificates = bool(data["scan_certificates"])
+        if "suppressions" in data:
+            cfg.honor_suppressions = bool(data["suppressions"])
+        if data.get("baseline"):
+            # Relative to the config file, so the same config works from any cwd.
+            raw = str(data["baseline"])
+            if source_path and not Path(raw).is_absolute():
+                raw = str(Path(source_path).parent / raw)
+            cfg.baseline_path = raw
 
         rules = data.get("rules") or {}
         if isinstance(rules, dict) and isinstance(rules.get("disable"), list):

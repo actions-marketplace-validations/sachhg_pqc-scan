@@ -42,6 +42,8 @@ CATEGORY_HASHING = "hashing"
 CATEGORY_KEY_EXCHANGE = "key-exchange"
 CATEGORY_CONFIGURATION = "configuration"
 CATEGORY_DEPENDENCY = "dependency"
+CATEGORY_KEY_MATERIAL = "key-material"
+CATEGORY_CERTIFICATE = "certificate"
 
 
 def severity_rank(severity: str) -> int:
@@ -89,9 +91,23 @@ class Finding:
     code_snippet: str
     migration_suggestion: MigrationSuggestion
     rule_id: str
+    #: Last line the detected construct occupies. ``None`` means it is a
+    #: single-line finding. Inline suppression directives are matched against
+    #: the whole span, so a trailing ``# pqc-scan: ignore`` after a multi-line
+    #: call works the way a developer expects.
+    end_line_number: Optional[int] = None
     #: Optional hint distinguishing library-implementation code from
     #: application usage (see scanner/context.py). None when no signal fired.
     context_hint: Optional[str] = None
+    #: True when an inline ``pqc-scan: ignore`` directive waived this finding.
+    #: Suppressed findings are kept out of ``ScanResult.findings`` but still
+    #: reported (as SARIF suppressions / counts) so a waiver stays auditable.
+    suppressed: bool = False
+    #: Human-readable description of the directive that suppressed it.
+    suppression_reason: Optional[str] = None
+    #: True when a baseline file already recorded this finding (pre-existing
+    #: debt). Baselined findings are reported separately and do not gate CI.
+    baselined: bool = False
 
     # ----- convenience helpers -------------------------------------------- #
 
@@ -102,6 +118,14 @@ class Finding:
     @property
     def location(self) -> str:
         return f"{self.file_path}:{self.line_number}:{self.column_number}"
+
+    @property
+    def line_span(self) -> tuple[int, int]:
+        """Inclusive (first, last) line the finding covers."""
+        end = self.end_line_number
+        if end is None or end < self.line_number:
+            return self.line_number, self.line_number
+        return self.line_number, end
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -126,7 +150,7 @@ def finding_sort_key(finding: Finding) -> tuple:
 
 @dataclass(frozen=True)
 class RuleDef:
-    """Static metadata for a detection rule (PQC001 .. PQC014)."""
+    """Static metadata for a detection rule (PQC001 .. PQC016)."""
 
     rule_id: str
     name: str
@@ -279,6 +303,28 @@ RULES: dict[str, RuleDef] = {
         primitive="pke",
         algorithm_family="dependency",
     ),
+    "PQC015": RuleDef(
+        rule_id="PQC015",
+        name="Quantum-Vulnerable Key Material",
+        description="A stored key (PEM/OpenSSH private or public key) whose algorithm is "
+        "broken by Shor's algorithm. Stored keys outlive the code that created them, so "
+        "they must be inventoried and rotated, not just rewritten in source.",
+        default_severity=SEVERITY_HIGH,
+        category=CATEGORY_KEY_MATERIAL,
+        primitive="pke",
+        algorithm_family="key-material",
+    ),
+    "PQC016": RuleDef(
+        rule_id="PQC016",
+        name="Quantum-Vulnerable Certificate",
+        description="An X.509 certificate or certificate request whose subject public key "
+        "or signature algorithm is quantum-vulnerable. Certificate chains are the slowest "
+        "part of a PQC migration because every relying party must accept the new algorithm.",
+        default_severity=SEVERITY_HIGH,
+        category=CATEGORY_CERTIFICATE,
+        primitive="signature",
+        algorithm_family="certificate",
+    ),
 }
 
 
@@ -300,6 +346,7 @@ def build_finding(
     column_number: int,
     algorithm: str,
     code_snippet: str,
+    end_line_number: int | None = None,
     severity: str | None = None,
     confidence: str = CONFIDENCE_HIGH,
     category: str | None = None,
@@ -333,6 +380,7 @@ def build_finding(
         code_snippet=code_snippet,
         migration_suggestion=migration,
         rule_id=rule_id,
+        end_line_number=end_line_number,
         context_hint=context_hint,
     )
 

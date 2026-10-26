@@ -21,7 +21,7 @@ import os
 from typing import Any
 
 from pqcscan import __version__
-from pqcscan.scanner.base import RULES, Finding, all_rules
+from pqcscan.scanner.base import RULES, Finding, all_rules, finding_sort_key
 from pqcscan.scanner.engine import ScanResult
 
 INFORMATION_URI = "https://github.com/pqc-scan/pqc-scan"
@@ -102,6 +102,11 @@ def _result(f: Finding, rule_index: dict[str, int], base_path: str, root_path: s
         "startLine": max(1, f.line_number),
         "startColumn": max(1, f.column_number),
     }
+    # Annotate the whole construct when it spans several lines, so a multi-line
+    # key-generation call is highlighted in full rather than by its first line.
+    start, end = f.line_span
+    if end > start:
+        region["endLine"] = end
     snippet = (f.code_snippet or "").strip()
     if snippet:
         region["snippet"] = {"text": snippet}
@@ -129,6 +134,15 @@ def _result(f: Finding, rule_index: dict[str, int], base_path: str, root_path: s
             "security-severity": _SECURITY_SEVERITY.get(f.severity, "5.0"),
         },
     }
+    if f.suppressed:
+        # SARIF models a waiver as a `suppressions` array on the result rather
+        # than by omitting it. GitHub code scanning honors this: the finding is
+        # recorded but not surfaced as an open alert, so an inline
+        # `pqc-scan: ignore` stays auditable in the Security tab.
+        suppression: dict[str, Any] = {"kind": "inSource", "status": "accepted"}
+        if f.suppression_reason:
+            suppression["justification"] = f.suppression_reason
+        result["suppressions"] = [suppression]
     if f.context_hint:
         result["properties"]["contextHint"] = f.context_hint
     if f.migration_suggestion:
@@ -167,7 +181,14 @@ def to_sarif(result: ScanResult, *, base_path: str = ".") -> dict[str, Any]:
                 },
                 "results": [
                     _result(f, rule_index, base_path, result.root_path)
-                    for f in result.findings
+                    # Suppressed findings are emitted too, carrying a SARIF
+                    # `suppressions` entry (see _result), so nothing silently
+                    # disappears from code scanning. Baselined findings are NOT:
+                    # the point of a baseline is that pre-existing debt stops
+                    # annotating pull requests.
+                    for f in sorted(
+                        [*result.findings, *result.suppressed], key=finding_sort_key
+                    )
                 ],
                 "columnKind": "unicodeCodePoints",
             }
